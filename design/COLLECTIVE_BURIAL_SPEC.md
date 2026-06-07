@@ -1,12 +1,18 @@
 # 合祀情報仕様書
 
-**バージョン**: v1.0.0
+**バージョン**: v1.1.0
 **実装状況**: ✅ 完了（Phase 1-5）
-**最終更新**: 2025-11-24
+**最終更新**: 2026-06-07
+
+> **v1.1.0 変更（backend #164 / PR #312）**: 請求予定日の起点を「埋葬上限到達日」から
+> **「契約日」** に変更。業務確認（2026-06-07 Q17: 合祀までの年数はお墓のタイプで自動的に
+> 決まる・契約から一定年数後に合祀・例外指定の要望）に基づく。旧設計は埋葬者数が上限に
+> 達するまで請求予定日が立たず、請求が発火しない問題があった。最終確認は業務確認シート
+> 第3版 Q36 で回収中。
 
 ## 概要
 
-合祀情報機能は、霊園の一区画に複数の故人を祀る管理を行います。埋葬上限人数に達した日から有効期間のカウントを開始し、期間満了時に請求を自動実行します。
+合祀情報機能は、霊園の一区画に複数の故人を祀る管理を行います。**契約日から有効期間（お墓のタイプで決まる年数）のカウントを開始し**、期間満了時に請求を自動実行します。埋葬上限人数（`capacity_reached_date`）は埋葬状況の記録として管理し、請求タイミングには影響しません。
 
 **実装完了機能**:
 - ✅ データモデル定義（Prisma）
@@ -49,9 +55,9 @@ model CollectiveBurial {
 | plot_id | String (UUID) | ✅ | 関連する区画ID（外部キー、1:1） |
 | burial_capacity | Int | ✅ | 埋葬可能な上限人数（例: 10人） |
 | current_burial_count | Int | ✅ | 現在の埋葬人数（BuriedPersonsから自動集計） |
-| capacity_reached_date | DateTime | ❌ | 上限到達日（上限人数に達した日時） |
-| validity_period_years | Int | ✅ | 有効期間（年単位、例: 1年、3年、5年） |
-| billing_scheduled_date | DateTime | ❌ | 請求予定日（上限到達日 + 有効期間） |
+| capacity_reached_date | DateTime | ❌ | 上限到達日（上限人数に達した日時。**記録用** — 請求には影響しない） |
+| validity_period_years | Int | ✅ | 有効期間（年単位。お墓のタイプで決まる: 13/15/24/33年等） |
+| billing_scheduled_date | DateTime | ❌ | 請求予定日（**契約日 + 有効期間**。契約日未設定なら null、契約日設定時に再計算。手動の例外指定可） |
 | billing_status | String | ✅ | 請求状況（pending/billed/paid） |
 | billing_amount | Decimal | ❌ | 請求金額（円） |
 | notes | String | ❌ | 備考・特記事項 |
@@ -91,22 +97,31 @@ model CollectiveBurial {
    current_burial_count = BuriedPersons.count({ where: { plot_id } })
    ```
 
-2. **上限到達判定**
+2. **上限到達判定（記録のみ — 請求予定日には影響しない）**
    ```typescript
    if (current_burial_count >= burial_capacity && !capacity_reached_date) {
-     capacity_reached_date = new Date()
-     billing_scheduled_date = addYears(capacity_reached_date, validity_period_years)
+     capacity_reached_date = new Date()  // 上限到達日を記録
    }
    ```
 
 3. **上限未満への戻り**
    ```typescript
    if (current_burial_count < burial_capacity && capacity_reached_date) {
-     // 上限を下回った場合、日付をリセット
-     capacity_reached_date = null
-     billing_scheduled_date = null
+     capacity_reached_date = null  // 到達日のみリセット（請求予定日は維持）
    }
    ```
+
+**請求予定日の管理（v1.1.0〜、契約日起点）**:
+```typescript
+// 作成時に導出（createPlot / createCollectiveBurial）
+billing_scheduled_date = contract_date != null
+  ? addYearsUtc(contract_date, validity_period_years)
+  : null  // 契約日未設定 → 契約日の設定時に再計算
+
+// 再計算トリガ: 契約日変更（updatePlot）／有効期間変更／合祀の新規・復活
+// 手動の例外指定（PUT /collective-burials/:id の billingScheduledDate）が最優先で、
+// 上記トリガに該当しない限り保持される（例: 決まった年数より短くする運用）
+```
 
 ### 3. 請求処理の自動実行
 
@@ -364,18 +379,18 @@ PUT /api/v1/plots/:id
 - 家族墓（区画A-56）に最大10人埋葬可能
 - 有効期間3年、期間満了後に50万円請求
 
-**タイムライン**:
-1. **2024年1月**: 区画作成、合祀情報登録（`burial_capacity=10`、`validity_period_years=3`）
+**タイムライン**（v1.1.0〜 契約日起点）:
+1. **2024年1月10日**: 区画作成（契約日=2024-01-10）、合祀情報登録（`burial_capacity=10`、`validity_period_years=3`）
+   - `billing_scheduled_date=2027-01-10`（**契約日の3年後** — この時点で確定）
 2. **2024年5月**: 1人目埋葬（`current_burial_count=1`）
 3. **2025年3月**: 8人目埋葬（`current_burial_count=8`）
 4. **2026年7月15日**: 10人目埋葬
    - `current_burial_count=10`
-   - `capacity_reached_date=2026-07-15`
-   - `billing_scheduled_date=2029-07-15`（3年後）
-5. **2029年7月15日**: バッチ処理実行
+   - `capacity_reached_date=2026-07-15`（記録のみ。請求予定日は変わらない）
+5. **2027年1月10日**: バッチ処理実行
    - 請求データ生成（50万円）
    - `billing_status="billed"`
-6. **2029年8月1日**: 入金確認
+6. **2027年2月1日**: 入金確認
    - `billing_status="paid"`
 
 ### ケース2: 上限未満での推移
