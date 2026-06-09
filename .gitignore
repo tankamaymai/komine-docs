@@ -1,4 +1,8 @@
 # テスト用認証情報
 テストユーザー情報.txt
 
+# Claude Code ローカル設定・ツール状態（マシン固有のため追跡しない）
+.claude/settings.local.json
+.audit-state.json
+
 # 参考画像・キャプチャは仕様の根拠資料として追跡する（ui-audit/・参考画面キャプチャ/ 等）
